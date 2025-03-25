@@ -4,16 +4,48 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-from langchain.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
+import pinecone
+from langchain_core.documents import Document
 
 # Load environment variables
 load_dotenv()
 os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Pinecone initialization
+from pinecone import Pinecone, ServerlessSpec
+
+# Create a Pinecone instance
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+
+# Create an index (if not exists)
+if "test-index" not in pc.list_indexes().names():
+    pc.create_index(
+        name="test-index",
+        dimension=768,  # Update this according to your embedding dimension
+        metric="cosine",  # You can also use "euclidean" or "dotproduct"
+        spec=ServerlessSpec(
+            cloud="aws", region="us-east-1"
+        ),  # Cloud and region can be updated as per your setup
+    )
+else:
+    # Check current dimension and delete and recreate if needed.
+    index_description = pc.describe_index("test-index")
+    if index_description.dimension != 768:
+        pc.delete_index("test-index")
+        pc.create_index(
+            name="test-index",
+            dimension=768,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+
+# Access the Pinecone index
+index = pc.Index("test-index")  # Specify your index name here
 
 
 # Function to extract text from PDF files
@@ -33,11 +65,21 @@ def get_text_chunks(text):
     return chunks
 
 
-# Function to create and save a vector store using FAISS
+# Function to create and save a vector store using Pinecone
 def get_vector_store(text_chunks):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index_02")
+
+    # Prepare the vectors for Pinecone upsert
+    vectors = []
+    for i, chunk in enumerate(text_chunks):
+        embedding = embeddings.embed_documents([chunk])[0]  # Corrected line
+        vectors.append(
+            {"id": f"vec_{i}", "values": embedding, "metadata": {"text": chunk}}
+        )
+
+    # Upsert vectors into Pinecone
+    index.upsert(vectors=vectors, namespace="pdf_namespace")
+    st.success("Vectors uploaded to Pinecone successfully.")
 
 
 # Function to define the conversational chain
@@ -65,12 +107,24 @@ def get_conversational_chain():
 def user_input(user_question):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
-    # Allow dangerous deserialization when loading the FAISS index (since it's from a trusted source)
-    new_db = FAISS.load_local(
-        "faiss_index_02", embeddings, allow_dangerous_deserialization=True
-    )
-    docs = new_db.similarity_search(user_question)
+    # Create a query vector from the user's question
+    query_vector = embeddings.embed_query(user_question)  # Corrected line
 
+    # Query Pinecone to find the most similar documents
+    response = index.query(
+        namespace="pdf_namespace",
+        vector=query_vector,
+        top_k=3,
+        include_values=True,
+        include_metadata=True,
+    )
+
+    # Extract the top documents from the response
+    docs = [
+        Document(page_content=item["metadata"]["text"]) for item in response["matches"]
+    ]  # Corrected line
+
+    # Get the conversational chain for answering the question
     chain = get_conversational_chain()
 
     # Generate a response using the question-answering chain
@@ -79,7 +133,6 @@ def user_input(user_question):
     )
 
     # Display the response in Streamlit
-    print(response)
     st.write("Reply: ", response["output_text"])
 
 
@@ -104,7 +157,6 @@ def main():
                 raw_text = get_pdf_text(pdf_docs)
                 text_chunks = get_text_chunks(raw_text)
                 get_vector_store(text_chunks)
-                st.success("Done")
 
 
 # Run the Streamlit app
